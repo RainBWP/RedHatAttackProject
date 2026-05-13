@@ -1,33 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Recon script for Debian/Kali — non-destructive by default.
-# Usage: sudo ./run_script.sh
-# Options: --target IP --aggressive (optional, more intrusive checks)
+# Robustness check script for Debian/Kali — non-destructive only.
+# Usage: ./run_script.sh --target IP [--focus dns,http,mysql]
 
 TARGET=""
-AGGRESSIVE=0
 REPORT_DIR="reports"
 PORTS="22,21,80,443,53,3306,9090,1514,1515"
+FOCUS="dns,http,mysql"
 
 function usage(){
   cat <<EOF
-Usage: sudo $0 --target 192.168.1.50 [--aggressive]
+Usage: $0 --target 192.168.1.50 [--focus dns,http,mysql]
 
-By default this script performs non-destructive checks (nmap default scripts, banner grabs,
-HTTP header checks, DNS queries, SSL cert fetch). Pass --aggressive to enable optional
-checks (AXFR attempt, anonymous FTP test, simple HTTP param probe).
+This script performs only non-destructive robustness checks:
+- DNS: NSID/version exposure, recursion behavior, basic record responses
+- HTTP: response headers, security headers, allowed methods, bounded latency sample
+- MySQL: port/service fingerprint and optional read-only validation with provided credentials
 
-Make sure required tools are installed: nmap, curl, dig, openssl, nc (netcat).
-To install on Debian/Kali: sudo apt update && sudo apt install -y nmap curl dnsutils openssl netcat
+Make sure required tools are installed: nmap, curl, dig, openssl, nc (netcat), mariadb-client (optional).
+To install on Debian/Kali: sudo apt update && sudo apt install -y nmap curl dnsutils openssl netcat-openbsd mariadb-client
 EOF
+}
+
+has_focus(){
+  local name="$1"
+  [[ ",$FOCUS," == *",$name,"* ]]
 }
 
 # parse args
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target) TARGET="$2"; shift 2;;
-    --aggressive) AGGRESSIVE=1; shift 1;;
+    --focus) FOCUS="$2"; shift 2;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1"; usage; exit 1;;
   esac
@@ -52,7 +57,22 @@ log(){
   echo "[$(date '+%F %T')] $*" | tee -a "$OUTDIR/run.log"
 }
 
-log "Starting passive reconnaissance for $TARGET (aggressive=$AGGRESSIVE)"
+need_cmd(){
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Missing command: $cmd"
+    echo "Install dependencies with: sudo ./install_deps.sh"
+    exit 1
+  fi
+}
+
+need_cmd nmap
+need_cmd curl
+need_cmd dig
+need_cmd openssl
+need_cmd nc
+
+log "Starting robustness checks for $TARGET (focus=$FOCUS)"
 
 # 1) Quick nmap default scripts and service/version on common ports
 log "Running nmap default scripts on common ports: $PORTS"
@@ -60,99 +80,96 @@ nmap -Pn -sV -p $PORTS --script default -oA "$OUTDIR/nmap_default" "$TARGET" | t
 
 sleep 2
 
-# 2) HTTP checks (headers + basic security headers)
-for p in 80 443 9090; do
-  if grep -q "${p}/open" "$OUTDIR/nmap_default.nmap" 2>/dev/null || grep -q ":${p}/tcp" "$OUTDIR/nmap_default.nmap" 2>/dev/null || netstat -an 2>/dev/null | true; then
-    log "Checking HTTP(S) on port $p"
-    proto="http"
-    if [[ $p -eq 443 ]]; then proto="https"; fi
-    curl -sS -I --max-time 10 "$proto://$TARGET:$p/" -o "$OUTDIR/http_${p}.headers" || true
-    # extract common security headers
-    awk 'BEGIN{IGNORECASE=1} /Strict-Transport-Security|X-Frame-Options|X-Content-Type-Options|Content-Security-Policy|Referrer-Policy/ {print}' "$OUTDIR/http_${p}.headers" > "$OUTDIR/http_${p}.secheaders" || true
-  fi
-done
+# 2) DNS checks (safe only)
+if has_focus "dns"; then
+  if grep -q "53/tcp.*open" "$OUTDIR/nmap_default.nmap" 2>/dev/null; then
+    log "Running DNS robustness checks"
 
-sleep 1
+    # Basic DNS answers
+    for t in SOA NS MX A; do
+      dig +noall +answer -t "$t" @"$TARGET" | tee -a "$OUTDIR/dns_${t}.txt" || true
+    done
 
-# 3) SSL certificate grab (if 443 open)
-if grep -q "443/tcp.*open" "$OUTDIR/nmap_default.nmap" 2>/dev/null; then
-  log "Fetching SSL certificate from $TARGET:443"
-  echo | openssl s_client -connect "$TARGET:443" -servername "$TARGET" 2>/dev/null | openssl x509 -noout -text > "$OUTDIR/ssl_443_cert.txt" || true
-fi
+    # NSID query output (the part you highlighted)
+    dig +nsid @"$TARGET" . SOA +noall +answer +authority +additional > "$OUTDIR/dns_nsid.txt" || true
 
-sleep 1
+    # Version disclosure test (CH class)
+    dig @"$TARGET" CHAOS TXT version.bind +short > "$OUTDIR/dns_version_bind.txt" || true
 
-# 4) DNS queries (non-intrusive) — SOA, NS, MX, A
-log "Running DNS queries against $TARGET (SOA, NS, MX, A)"
-for t in SOA NS MX A; do
-  dig +noall +answer -t $t @$TARGET | tee -a "$OUTDIR/dns_${t}.txt" || true
-done
+    # Recursion behavior test against external domain
+    dig @"$TARGET" example.com A +time=3 +tries=1 +comments > "$OUTDIR/dns_recursion_test.txt" || true
 
-# optional AXFR if aggressive
-if [[ $AGGRESSIVE -eq 1 ]]; then
-  read -rp "(Aggressive) Try AXFR (zone transfer) against target? y/N: " axfrans
-  if [[ "$axfrans" =~ ^[Yy]$ ]]; then
-    log "Attempting AXFR against target"
-    dig @$TARGET AXFR +noall +answer | tee "$OUTDIR/dns_axfr.txt" || true
+    # Optional DNSSEC-related response visibility
+    dig @"$TARGET" . DNSKEY +dnssec +time=3 +tries=1 > "$OUTDIR/dns_dnssec_probe.txt" || true
+  else
+    log "DNS (53/tcp) is not open in nmap results; skipping DNS checks"
   fi
 fi
 
 sleep 1
 
-# 5) FTP anonymous check (optional/aggressive)
-if [[ $AGGRESSIVE -eq 1 ]]; then
-  if grep -q "21/tcp.*open" "$OUTDIR/nmap_default.nmap" 2>/dev/null; then
-    read -rp "(Aggressive) Test anonymous FTP login? y/N: " ftpants
-    if [[ "$ftpants" =~ ^[Yy]$ ]]; then
-      log "Testing anonymous FTP login"
-      # using netcat for a simple banner/login test
-      { echo -e "USER anonymous\r\nPASS anonymous@\r\nQUIT\r\n"; } | nc -w 5 "$TARGET" 21 > "$OUTDIR/ftp_anonymous.txt" || true
+# 3) HTTP checks (safe only)
+if has_focus "http"; then
+  for p in 80 443 9090; do
+    if grep -q "${p}/tcp.*open" "$OUTDIR/nmap_default.nmap" 2>/dev/null; then
+      log "Checking HTTP(S) on port $p"
+      proto="http"
+      if [[ $p -eq 443 ]]; then proto="https"; fi
+
+      curl -sS -I --max-time 10 "$proto://$TARGET:$p/" -o "$OUTDIR/http_${p}.headers" || true
+
+      # Extract common security headers for quick scoring in the report
+      awk 'BEGIN{IGNORECASE=1} /Strict-Transport-Security|X-Frame-Options|X-Content-Type-Options|Content-Security-Policy|Referrer-Policy|Permissions-Policy/ {print}' "$OUTDIR/http_${p}.headers" > "$OUTDIR/http_${p}.secheaders" || true
+
+      # Supported HTTP methods (informational)
+      nmap -Pn -p "$p" --script http-methods --script-args http-methods.url-path=/ "$TARGET" > "$OUTDIR/http_${p}_methods.txt" || true
+
+      # Bounded latency sample (20 sequential requests)
+      : > "$OUTDIR/http_${p}_latency.txt"
+      for i in $(seq 1 20); do
+        curl -sS -o /dev/null --max-time 5 -w "req=${i} code=%{http_code} total=%{time_total}\n" "$proto://$TARGET:$p/" >> "$OUTDIR/http_${p}_latency.txt" || true
+      done
+
+      # SSL certificate grab for HTTPS
+      if [[ $p -eq 443 ]]; then
+        echo | openssl s_client -connect "$TARGET:443" -servername "$TARGET" 2>/dev/null | openssl x509 -noout -text > "$OUTDIR/ssl_443_cert.txt" || true
+      fi
+    fi
+  done
+fi
+
+sleep 1
+
+# 4) MySQL checks (safe only)
+if has_focus "mysql"; then
+  if grep -q "3306/tcp.*open" "$OUTDIR/nmap_default.nmap" 2>/dev/null; then
+    log "MySQL/MariaDB port open (3306) — running safe checks"
+
+    timeout 5 bash -c "echo | nc -w 5 $TARGET 3306" > "$OUTDIR/mysql_banner.txt" || true
+    nmap -Pn -p 3306 --script mysql-info "$TARGET" > "$OUTDIR/mysql_info.txt" || true
+
+    if command -v mysql >/dev/null 2>&1; then
+      read -rp "Run read-only SQL validation using credentials? y/N: " mysqlcheck
+      if [[ "$mysqlcheck" =~ ^[Yy]$ ]]; then
+        read -rp "MySQL user: " MYSQL_USER
+        read -rsp "MySQL password: " MYSQL_PASS
+        echo
+        read -rp "Database name (example: demo_security): " MYSQL_DB
+
+        MYSQL_PWD="$MYSQL_PASS" mysql -h "$TARGET" -u "$MYSQL_USER" -D "$MYSQL_DB" --connect-timeout=5 -e "SHOW TABLES;" > "$OUTDIR/mysql_tables.txt" 2> "$OUTDIR/mysql_tables.err" || true
+        MYSQL_PWD="$MYSQL_PASS" mysql -h "$TARGET" -u "$MYSQL_USER" -D "$MYSQL_DB" --connect-timeout=5 -e "SELECT COUNT(*) AS users_count FROM users;" > "$OUTDIR/mysql_users_count.txt" 2> "$OUTDIR/mysql_users_count.err" || true
+      fi
+    else
+      log "mysql client not found; skipping credentialed MySQL validation"
     fi
   fi
 fi
 
 sleep 1
 
-# 6) MariaDB/MySQL check (banner only)
-if grep -q "3306/tcp.*open" "$OUTDIR/nmap_default.nmap" 2>/dev/null; then
-  log "MySQL/MariaDB port open (3306) — grabbing banner"
-  timeout 5 bash -c "echo | nc -w 5 $TARGET 3306" > "$OUTDIR/mysql_banner.txt" || true
-fi
-
-sleep 1
-
-# 7) Check for Cockpit (9090)
-if grep -q "9090/tcp.*open" "$OUTDIR/nmap_default.nmap" 2>/dev/null; then
-  log "Cockpit detected on 9090 — fetching headers"
-  curl -sS -I --max-time 10 "http://$TARGET:9090/" -o "$OUTDIR/cockpit_headers.txt" || true
-fi
-
-sleep 1
-
-# 8) Port state summary and inference about firewall
+# 5) Port state summary
 log "Summarizing port states"
 grep -E "open|filtered|closed" "$OUTDIR/nmap_default.nmap" | tee "$OUTDIR/port_states.txt" || true
-
-# 9) Optional simple HTTP parameter probe (aggressive)
-if [[ $AGGRESSIVE -eq 1 ]]; then
-  # Very simple and safe probe: check if adding a single quote changes response length significantly
-  if [[ -f "$OUTDIR/http_80.headers" || -f "$OUTDIR/http_443.headers" ]]; then
-    read -rp "(Aggressive) Run simple HTTP param probe on /?id=1 ? y/N: " httpprobe
-    if [[ "$httpprobe" =~ ^[Yy]$ ]]; then
-      for proto in http https; do
-        for p in 80 443; do
-          if [[ $p -eq 80 && -f "$OUTDIR/http_80.headers" ]] || [[ $p -eq 443 && -f "$OUTDIR/http_443.headers" ]]; then
-            url="$proto://$TARGET:$p/"
-            resp1=$(curl -sS --max-time 10 "$url?id=1") || true
-            resp2=$(curl -sS --max-time 10 "$url?id=1'" ) || true
-            echo "LEN_NORMAL=${#resp1}" > "$OUTDIR/http_probe_${p}.txt"
-            echo "LEN_INJECT=${#resp2}" >> "$OUTDIR/http_probe_${p}.txt"
-          fi
-        done
-      done
-    fi
-  fi
-fi
 
 log "Recon finished. Reports in: $OUTDIR"
 
