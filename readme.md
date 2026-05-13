@@ -4,18 +4,19 @@
 Scripts de **comprobacion y robustez no destructiva** para Debian/Kali Linux contra un servidor Raspberry Pi con multiples servicios.
 
 ### Checar Logs en Pi
-```sh
+```bash
 ssh pi@[ip]
 sudo tail -f /var/log/suricata/fast.log
 ```
+---
 ### Configuracion de IPStatuc
-**Raspberry**
-``` sh
+#### **Raspberry**
+```bash
 nmcli connection show
 sudo nmcli con mod "Wired connection 1" ipv4.addresses 192.168.10.2/24 ipv4.method manual
 sudo nmcli con up "Wired connection 1"
 ```
-**Windows**
+#### **Windows**
 1. Panel de Control
 2. Redes e Internet
 3. Ethernet > Propiedades
@@ -27,8 +28,8 @@ sudo nmcli con up "Wired connection 1"
 
 Probar haciendo `ping 192.168.10.2` a la berry
 ### Configuracion de DHCP
-**Raspberry**
-```sh
+#### **Raspberry**
+```bash
 sudo nmcli con mod "Wired connection 1" ipv4.method auto
 sudo nmcli con mod "Wired connection 1" ipv4.addresses ""
 sudo nmcli con up "Wired connection 1"
